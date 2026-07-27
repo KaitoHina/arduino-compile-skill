@@ -22,6 +22,7 @@ import { basename, dirname, join } from "path";
 
 const ARDUINO_LIB_DIR = join(homedir(), "Documents", "Arduino", "libraries");
 const LIB_DIR = join(import.meta.dirname, "..", "..", "..", "libraries");
+const RSYNC_EXCLUDES = ["--exclude", ".git", "--exclude", ".vscode", "--exclude", ".claude", "--exclude", ".DS_Store"];
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -163,7 +164,8 @@ function resolveHeaderInclude(headerPath, extraDirs) {
     }
     return makeInclude(parts.slice(1).join("/"));
   }
-  // 2. 不在 ARDUINO_LIB_DIR → 搵 src/ 做 root，用相對 path
+  // 2. 不在 ARDUINO_LIB_DIR → 自動 sync 到 Arduino libraries 再 resolve
+  //     detect library name (headerPath 嘅 parent 做 lib name)
   const parts = headerPath.split("/");
   const srcIdx = parts.lastIndexOf("src");
   if (srcIdx !== -1) {
@@ -178,21 +180,40 @@ function resolveHeaderInclude(headerPath, extraDirs) {
   return makeInclude(basename(headerPath));
 }
 
+function rsyncToLib(src, name) {
+  const targetDir = join(ARDUINO_LIB_DIR, name);
+  console.log(`\n📋 同步: ${src} → ${targetDir}`);
+  mkdirSync(targetDir, { recursive: true });
+  run(`rsync -av --delete "${src}/" "${targetDir}/" ${RSYNC_EXCLUDES.join(" ")}`, { timeout: 30000 });
+  console.log(`✅ 同步完成: ${name}`);
+}
+
+/**
+ * 向上搵 library root（有 src/ 或 library.properties 嘅 parent）
+ * 傳回路徑同 library name，搵唔到就 return null
+ */
+function findLibRoot(headerPath) {
+  let libRoot = dirname(headerPath);
+  while (libRoot !== "/") {
+    if (existsSync(join(libRoot, "src")) || existsSync(join(libRoot, "library.properties"))) {
+      return { root: libRoot, name: basename(libRoot) };
+    }
+    libRoot = dirname(libRoot);
+  }
+  return null;
+}
+
 /**
  * 從本地 ~/.claude/skills/arduino-compile/libraries/ 同步 library 到 Arduino libraries
  */
 function syncLocalLib(name, fallbackSrc) {
   const srcDir = join(LIB_DIR, name);
-  const targetDir = join(ARDUINO_LIB_DIR, name);
   const actualSrc = existsSync(srcDir) ? srcDir : fallbackSrc;
   if (!actualSrc) {
     console.error(`錯誤: 找不到 library ${name}，不在 ${srcDir} 也未提供來源路徑`);
     process.exit(1);
   }
-  console.log(`\n📋 同步本地庫: ${actualSrc} → ${targetDir}`);
-  mkdirSync(targetDir, { recursive: true });
-  run(`rsync -av --delete "${actualSrc}/" "${targetDir}/"`, { timeout: 30000 });
-  console.log(`✅ 同步完成: ${name}`);
+  rsyncToLib(actualSrc, name);
 }
 
 /**
@@ -204,33 +225,26 @@ function syncGithubLib(url, name) {
   console.log(`\n📦 克隆庫: ${name} (${url})`);
   run(`git clone --depth 1 "${url}" "${cloneDir}"`, { timeout: 60000 });
 
-  const targetDir = join(ARDUINO_LIB_DIR, name);
-
-  // 查找實際的庫目錄（有些 repo 的庫程式碼在子目錄中）
+  // 查找實際嘅 library root（src/ 或 library.properties）
+  // findLibRoot 由 cloneDir 向上搵，但 clone 完 root 已經係 library root
   let srcDir = cloneDir;
-  if (existsSync(join(cloneDir, "src"))) {
-    srcDir = join(cloneDir, "src");
-  } else if (existsSync(join(cloneDir, "library.properties"))) {
-    srcDir = cloneDir;
-  } else {
-    // 嘗試查找包含 library.properties 的子目錄
+  const libMeta = findLibRoot(cloneDir);
+  if (libMeta) srcDir = libMeta.root;
+  else {
+    // fallback: maxdepth 2 搵 library.properties
     try {
       const found = run(`find "${cloneDir}" -maxdepth 2 -name "library.properties" -type f 2>/dev/null | head -1`).trim();
-      if (found) {
-        srcDir = dirname(found);
-      }
+      if (found) srcDir = dirname(found);
     } catch (_) {}
   }
 
-  console.log(`📋 同步到: ${targetDir}`);
-  // 確保目標目錄存在，先用 rsync 同步
-  mkdirSync(targetDir, { recursive: true });
-  run(`rsync -av --delete "${srcDir}/" "${targetDir}/"`, { timeout: 30000 });
+  console.log(`📋 同步到: ${join(ARDUINO_LIB_DIR, name)}`);
+  rsyncToLib(srcDir, name);
 
   // 清理 clone 暫存目錄
   rmSync(cloneDir, { recursive: true, force: true });
 
-  console.log(`✅ 庫已同步: ${name} → ${targetDir}`);
+  console.log(`✅ 庫已同步: ${name}`);
 }
 
 /**
@@ -285,6 +299,16 @@ async function main() {
     for (const lib of opts.libs) {
       syncGithubLib(lib.url, lib.name);
     }
+  }
+
+  // 3. 如果係 --header 且 header 唔喺 Arduino/libraries 入面 → auto sync 成個 library folder
+  if (opts.headerPath && !opts.headerPath.startsWith(ARDUINO_LIB_DIR + "/")) {
+    const lib = findLibRoot(opts.headerPath);
+    if (!lib) {
+      console.error(`錯誤: 無法偵測 library root，路徑: ${opts.headerPath}`);
+      process.exit(1);
+    }
+    rsyncToLib(lib.root, lib.name);
   }
 
   // 自動掃描 ~/Documents/Arduino/libraries/*/src/ 下所有子目錄加入 -I
