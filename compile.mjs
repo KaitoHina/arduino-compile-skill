@@ -191,7 +191,7 @@ function syncLocalLib(name, fallbackSrc) {
   }
   console.log(`\n📋 同步本地庫: ${actualSrc} → ${targetDir}`);
   mkdirSync(targetDir, { recursive: true });
-  run(`rsync -a "${actualSrc}/" "${targetDir}/"`, { timeout: 30000 });
+  run(`rsync -av --delete "${actualSrc}/" "${targetDir}/"`, { timeout: 30000 });
   console.log(`✅ 同步完成: ${name}`);
 }
 
@@ -225,7 +225,7 @@ function syncGithubLib(url, name) {
   console.log(`📋 同步到: ${targetDir}`);
   // 確保目標目錄存在，先用 rsync 同步
   mkdirSync(targetDir, { recursive: true });
-  run(`rsync -a "${srcDir}/" "${targetDir}/"`, { timeout: 30000 });
+  run(`rsync -av --delete "${srcDir}/" "${targetDir}/"`, { timeout: 30000 });
 
   // 清理 clone 暫存目錄
   rmSync(cloneDir, { recursive: true, force: true });
@@ -235,11 +235,14 @@ function syncGithubLib(url, name) {
 
 /**
  * 編譯 sketch
+ *
+ * 每次 compile 都會用 --clean 強制 full recompile，
+ * 確保 Arduino library 嘅 .cpp 重新 link，唔會用 cache 咗嘅舊 object files。
  */
 function compile(sketchDir, fqbn, extraIncludeDirs = []) {
-  console.log(`\n🔨 編譯中... (FQBN: ${fqbn})`);
+  console.log(`\n🔨 編譯中... (FQBN: ${fqbn}) [--clean: 強制 full recompile]`);
   try {
-    let cmd = `arduino-cli compile --fqbn "${fqbn}"`;
+    let cmd = `arduino-cli compile --clean --fqbn "${fqbn}"`;
     // 將 src/ 目錄及所有子目錄透過 -I 加入 compiler 搜尋路徑
     // 同時設定 compiler.c.extra_flags 和 compiler.cpp.extra_flags
     // 這樣就可以直接用 #include <modules/Bluetooth/BLEManager.h>
