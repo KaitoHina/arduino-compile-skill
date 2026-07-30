@@ -59,6 +59,7 @@ function parseArgs() {
   node compile.mjs --code "<ino程式碼>" --fqbn <FQBN> [--lib "url,name" ...]
   node compile.mjs --sketch <path> --fqbn <FQBN> [--lib "url,name" ...]
   node compile.mjs --header <path> --fqbn <FQBN> [--lib "url,name" ...]
+  node compile.mjs --lib-sync <name>                          # sync only, 唔 compile
 
 選項:
   --code <string>      .ino 程式碼內容
@@ -66,22 +67,25 @@ function parseArgs() {
   --header <path>      單個 .h 檔案路徑（自動產生 wrapper .ino 編譯）
   --fqbn <string>      目標板 FQBN（必需，如 arduino:avr:uno）
   --lib "url,name"     從 GitHub clone 的庫（可多次使用）
-  --lib-sync <name>    用 rsync 同步本地 library 到 Arduino libraries（從 ~/.claude/skills/arduino-compile/libraries/name/）
+  --lib-sync <name>    從 ~/.claude/skills/.../libraries/name/ rsync 到 Arduino libraries
+                       可獨立使用（淨 sync）或配合 --code/--sketch/--header（sync → compile）
   -h, --help           顯示說明
 `);
         process.exit(0);
     }
   }
 
-  if (!opts.fqbn) {
-    console.error("錯誤: 必須指定 --fqbn 參數");
+  const hasCode = opts.code || opts.sketchPath || opts.headerPath;
+  if (hasCode && !opts.fqbn) {
+    console.error("錯誤: 編譯模式必須指定 --fqbn 參數");
     process.exit(1);
   }
-  if (!opts.code && !opts.sketchPath && !opts.headerPath) {
-    console.error("錯誤: 必須指定 --code 或 --sketch 或 --header 參數");
+  if (!hasCode && !opts.libName) {
+    console.error("錯誤: 必須指定 --code / --sketch / --header 或 --lib-sync");
     process.exit(1);
   }
 
+  opts.hasCode = hasCode;
   return opts;
 }
 
@@ -301,7 +305,14 @@ async function main() {
     }
   }
 
-  // 3. 如果係 --header 且 header 唔喺 Arduino/libraries 入面 → auto sync 成個 library folder
+  // 3. 如果淨係 sync → 完
+  if (!opts.hasCode) {
+    const output = { success: true, output: "Sync only, no compile requested" };
+    console.log(`\n---JSON-RESULT---\n${JSON.stringify(output)}\n---JSON-RESULT---`);
+    process.exit(0);
+  }
+
+  // 4. 如果係 --header 且 header 唔喺 Arduino/libraries 入面 → auto sync 成個 library folder
   if (opts.headerPath && !opts.headerPath.startsWith(ARDUINO_LIB_DIR + "/")) {
     const lib = findLibRoot(opts.headerPath);
     if (!lib) {
@@ -314,7 +325,7 @@ async function main() {
   // 自動掃描 ~/Documents/Arduino/libraries/*/src/ 下所有子目錄加入 -I
   extraIncludeDirs = scanLibraries();
 
-  // 2. 準備 sketch
+  // 5. 準備 sketch
   if (opts.code) {
     const result = createTempSketch(opts.code);
     sketchDir = result.sketchDir;
