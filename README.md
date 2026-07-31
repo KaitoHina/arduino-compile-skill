@@ -44,8 +44,8 @@ node ~/.claude/skills/arduino-compile/compile.mjs --header ./MyLib.h --fqbn ardu
 # 加 GitHub library
 node ~/.claude/skills/arduino-compile/compile.mjs --code '...' --fqbn esp32:esp32:esp32 --lib "https://github.com/adafruit/Adafruit-GFX-Library,Adafruit_GFX"
 
-# 同步本地 library
-node ~/.claude/skills/arduino-compile/compile.mjs --lib-sync MyCustomLib
+# 同步本地 library（開發庫源路徑，例如 git repo）
+node ~/.claude/skills/arduino-compile/compile.mjs --lib-sync /Users/GodLight/Documents/Coding/GitHub/PeanutKing_Soccer
 ```
 
 ## 支援板型
@@ -65,18 +65,18 @@ node ~/.claude/skills/arduino-compile/compile.mjs --lib-sync MyCustomLib
 ```
 
 - 自動處理 sketch 資料夾名 == .ino 檔名（arduino-cli 要求）
-- 自動掃描 `~/Documents/Arduino/libraries/*/src/` 下所有子目錄加入 `-I`
+- `--header` 時自動加目標 library 嘅 `src/` root 做 `-I`，子路徑 header（如 `#include <modules/Sub/Header.h>`）可直接引用
+- 唔掃全部 library 子目錄加 `-I`（避免同 SDK header 如 FreeRTOS `queue.h` 撞名，esp32 會 compile 失敗）
 - 單獨 `.h` 檔自動產生 wrapper `.ino`
-- 輸出 `---JSON-RESULT---` 俾 agent 解析
+- `--lib-sync <path>`：將開發中嘅 library（源路徑）rsync 去 `~/Documents/Arduino/libraries/<basename>/`，可獨立執行或配合編譯指令
+- 輸出 JSON 俾 agent 解析
 
 ## 目錄結構
 
 ```
 arduino-compile/
 ├── SKILL.md          # skill 描述
-├── compile.mjs       # 編譯腳本
-├── .claude/settings.local.json
-└── libraries/        # （可選）本地 library
+└── compile.mjs       # 編譯腳本
 ```
 
 ## License
