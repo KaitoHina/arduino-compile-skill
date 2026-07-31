@@ -1,404 +1,141 @@
 #!/usr/bin/env node
-
-/**
- * compile.mjs — Arduino 編譯檢查驅動腳本
- *
- * 用法：
- *   node compile.mjs --code "<ino程式碼>" --fqbn <FQBN> [--lib "url,name" ...]
- *   node compile.mjs --sketch <path/to/sketch.ino> --fqbn <FQBN> [--lib "url,name" ...]
- *   node compile.mjs --header <path/to/header.h> --fqbn <FQBN> [--lib "url,name" ...]
- *
- * 功能：
- *   1. 自動生成合法的 .ino sketch 資料夾結構
- *   2. 從 GitHub clone 庫並用 rsync 同步到 ~/Documents/Arduino/libraries/
- *   3. 用 arduino-cli compile 編譯檢查
- *   4. 直接編譯單個 .h 檔案（自動產生 wrapper .ino）
- */
-
 import { execSync } from "child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { basename, dirname, join } from "path";
 
-const ARDUINO_LIB_DIR = join(homedir(), "Documents", "Arduino", "libraries");
-const LIB_DIR = join(import.meta.dirname, "..", "..", "..", "libraries");
-const RSYNC_EXCLUDES = ["--exclude", ".git", "--exclude", ".vscode", "--exclude", ".claude", "--exclude", ".DS_Store"];
+// 目標 Arduino libraries 目錄（arduino-cli 實際使用呢度）
+const A_LIB = join(homedir(), "Documents", "Arduino", "libraries");
 
-function parseArgs() {
-  const args = process.argv.slice(2);
-  const opts = { code: null, sketchPath: null, headerPath: null, fqbn: null, libs: [], libName: null };
+// 執行 shell command；timeout 單位係毫秒
+function run(cmd, timeout = 120000) {
+  return execSync(cmd, { encoding: "utf-8", stdio: "pipe", timeout });
+}
 
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case "--code":
-        opts.code = args[++i];
-        break;
-      case "--sketch":
-        opts.sketchPath = args[++i];
-        break;
-      case "--header":
-        opts.headerPath = args[++i];
-        break;
-      case "--fqbn":
-        opts.fqbn = args[++i];
-        break;
-      case "--lib": {
-        const val = args[++i];
-        const [url, name] = val.split(",").map((s) => s.trim());
-        if (url && name) opts.libs.push({ url, name });
-        break;
-      }
-      case "--lib-sync": {
-        opts.libName = args[++i];
-        break;
-      }
-      case "--help":
-      case "-h":
-        console.log(`
-用法:
-  node compile.mjs --code "<ino程式碼>" --fqbn <FQBN> [--lib "url,name" ...]
-  node compile.mjs --sketch <path> --fqbn <FQBN> [--lib "url,name" ...]
-  node compile.mjs --header <path> --fqbn <FQBN> [--lib "url,name" ...]
-  node compile.mjs --lib-sync <name>                          # sync only, 唔 compile
-
-選項:
-  --code <string>      .ino 程式碼內容
-  --sketch <path>      已有 .ino 檔案路徑
-  --header <path>      單個 .h 檔案路徑（自動產生 wrapper .ino 編譯）
-  --fqbn <string>      目標板 FQBN（必需，如 arduino:avr:uno）
-  --lib "url,name"     從 GitHub clone 的庫（可多次使用）
-  --lib-sync <name>    從 ~/.claude/skills/.../libraries/name/ rsync 到 Arduino libraries
-                       可獨立使用（淨 sync）或配合 --code/--sketch/--header（sync → compile）
-  -h, --help           顯示說明
-`);
-        process.exit(0);
+// 由任意路徑向上搵 library 根目錄（有 src/ 或 library.properties 即係根）
+// 用嚟判斷 header 屬於邊個 library，以及 clone 完之後搵 lib root
+function findLibRoot(path) {
+  let dir = dirname(path);
+  while (dir !== "/") {
+    if (existsSync(join(dir, "src")) || existsSync(join(dir, "library.properties"))) {
+      return { root: dir, name: basename(dir) };
     }
-  }
-
-  const hasCode = opts.code || opts.sketchPath || opts.headerPath;
-  if (hasCode && !opts.fqbn) {
-    console.error("錯誤: 編譯模式必須指定 --fqbn 參數");
-    process.exit(1);
-  }
-  if (!hasCode && !opts.libName) {
-    console.error("錯誤: 必須指定 --code / --sketch / --header 或 --lib-sync");
-    process.exit(1);
-  }
-
-  opts.hasCode = hasCode;
-  return opts;
-}
-
-function run(cmd, opts = {}) {
-  return execSync(cmd, { encoding: "utf-8", stdio: "pipe", ...opts });
-}
-
-/**
- * 建立暫存 sketch 目錄，寫入 .ino 檔案
- * sketch 資料夾名必須與 .ino 檔案名一致
- */
-function createTempSketch(code) {
-  const sketchName = "sketch";
-  const tmpDir = join(tmpdir(), `arduino-compile-${Date.now()}`);
-  const sketchDir = join(tmpDir, sketchName);
-  mkdirSync(sketchDir, { recursive: true });
-
-  const inoPath = join(sketchDir, `${sketchName}.ino`);
-  writeFileSync(inoPath, code, "utf-8");
-  return { sketchDir, inoPath, tmpDir };
-}
-
-/**
- * 遞迴掃描目錄下所有子目錄，回傳完整路徑列表
- */
-function scanDirsRecursive(dir) {
-  const results = [];
-  const entries = readdirSync(dir, { withFileTypes: true });
-  for (const e of entries) {
-    if (e.isDirectory()) {
-      const full = join(dir, e.name);
-      results.push(full, ...scanDirsRecursive(full));
-    }
-  }
-  return results;
-}
-
-function scanLibraries() {
-  const dirs = [ARDUINO_LIB_DIR, LIB_DIR];
-  const results = [];
-  for (const base of dirs) {
-    if (!existsSync(base)) continue;
-    for (const entry of readdirSync(base, { withFileTypes: true })) {
-      if (entry.isDirectory()) {
-        const srcDir = join(base, entry.name, "src");
-        if (existsSync(srcDir)) {
-          results.push(srcDir, ...scanDirsRecursive(srcDir));
-        }
-      }
-    }
-  }
-  return results;
-}
-
-function ensureLibDir() {
-  if (!existsSync(ARDUINO_LIB_DIR)) {
-    mkdirSync(ARDUINO_LIB_DIR, { recursive: true });
-    console.log(`建立庫目錄: ${ARDUINO_LIB_DIR}`);
-  }
-}
-
-/**
- * 將 header 絕對路徑轉成 library-style include 和對應的 .ino wrapper
- * ex: /libraries/MyLib/src/Sub.h → <Sub.h>, #include <Sub.h>
- * ex: /libraries/MyLib/src/modules/X.h → <modules/X.h>
- */
-function resolveHeaderInclude(headerPath, extraDirs) {
-  const makeInclude = (subPath) => ({
-    include: `<${subPath}>`,
-    code: `#include <${subPath}>\n\nvoid setup() {}\nvoid loop() {}`
-  });
-
-  // 1. 已在 ARDUINO_LIB_DIR → 原有邏輯
-  const libPrefix = ARDUINO_LIB_DIR + "/";
-  if (headerPath.startsWith(libPrefix)) {
-    const after = headerPath.substring(libPrefix.length);
-    const parts = after.split("/");
-    if (parts.length >= 3 && parts[1] === "src") {
-      return makeInclude(parts.slice(2).join("/"));
-    }
-    return makeInclude(parts.slice(1).join("/"));
-  }
-  // 2. 不在 ARDUINO_LIB_DIR → 自動 sync 到 Arduino libraries 再 resolve
-  //     detect library name (headerPath 嘅 parent 做 lib name)
-  const parts = headerPath.split("/");
-  const srcIdx = parts.lastIndexOf("src");
-  if (srcIdx !== -1) {
-    const srcRoot = parts.slice(0, srcIdx + 1).join("/");
-    const subPath = parts.slice(srcIdx + 1).join("/");
-    extraDirs.push(srcRoot);
-    return makeInclude(subPath);
-  }
-  // 3. 冇 src/ 目錄 → fallback: 用 parent dir 做 include root
-  const parentDir = dirname(headerPath);
-  extraDirs.push(parentDir);
-  return makeInclude(basename(headerPath));
-}
-
-function rsyncToLib(src, name) {
-  const targetDir = join(ARDUINO_LIB_DIR, name);
-  console.log(`\n📋 同步: ${src} → ${targetDir}`);
-  mkdirSync(targetDir, { recursive: true });
-  run(`rsync -av --delete "${src}/" "${targetDir}/" ${RSYNC_EXCLUDES.join(" ")}`, { timeout: 30000 });
-  console.log(`✅ 同步完成: ${name}`);
-}
-
-/**
- * 向上搵 library root（有 src/ 或 library.properties 嘅 parent）
- * 傳回路徑同 library name，搵唔到就 return null
- */
-function findLibRoot(headerPath) {
-  let libRoot = dirname(headerPath);
-  while (libRoot !== "/") {
-    if (existsSync(join(libRoot, "src")) || existsSync(join(libRoot, "library.properties"))) {
-      return { root: libRoot, name: basename(libRoot) };
-    }
-    libRoot = dirname(libRoot);
+    dir = dirname(dir);
   }
   return null;
 }
 
-/**
- * 從本地 ~/.claude/skills/arduino-compile/libraries/ 同步 library 到 Arduino libraries
- */
-function syncLocalLib(name, fallbackSrc) {
-  const srcDir = join(LIB_DIR, name);
-  const actualSrc = existsSync(srcDir) ? srcDir : fallbackSrc;
-  if (!actualSrc) {
-    console.error(`錯誤: 找不到 library ${name}，不在 ${srcDir} 也未提供來源路徑`);
-    process.exit(1);
-  }
-  rsyncToLib(actualSrc, name);
+// rsync 源 library 入 A_LIB；--delete 確保目標 = 源（清 stale 檔案）
+// 排除開發工具目錄，避免污染 Arduino 環境
+function rsync(sourceDir, name) {
+  const target = join(A_LIB, name);
+  mkdirSync(target, { recursive: true });
+  run(`rsync -av --delete "${sourceDir}/" "${target}/" --exclude .git --exclude .vscode --exclude .claude --exclude .DS_Store`, 30000);
 }
 
-/**
- * 從 GitHub clone 庫並用 rsync 同步到 Arduino 庫目錄
- */
-function syncGithubLib(url, name) {
-  const cloneDir = join(tmpdir(), `arduino-lib-clone-${Date.now()}-${name}`);
-
-  console.log(`\n📦 克隆庫: ${name} (${url})`);
-  run(`git clone --depth 1 "${url}" "${cloneDir}"`, { timeout: 60000 });
-
-  // 查找實際嘅 library root（src/ 或 library.properties）
-  // findLibRoot 由 cloneDir 向上搵，但 clone 完 root 已經係 library root
-  let srcDir = cloneDir;
-  const libMeta = findLibRoot(cloneDir);
-  if (libMeta) srcDir = libMeta.root;
-  else {
-    // fallback: maxdepth 2 搵 library.properties
-    try {
-      const found = run(`find "${cloneDir}" -maxdepth 2 -name "library.properties" -type f 2>/dev/null | head -1`).trim();
-      if (found) srcDir = dirname(found);
-    } catch (_) {}
+// 將 header 路徑轉成 wrapper include + 需要嘅 -I 目錄：
+// - A_LIB 內 src/ 路徑（如 .../TestLib/src/modules/X.h）→ include <modules/X.h>，src/ root 加做 -I
+// - A_LIB 外 /src/ 路徑 → 同上（resolveInclude 後 rsync 咗先 compile）
+// - 其他 → 直接用 basename，header 所在目錄加做 -I
+function resolveInclude(headerPath, extraDirs) {
+  const wrapInclude = s => ({ include: `<${s}>`, code: `#include <${s}>\n\nvoid setup() {}\nvoid loop() {}` });
+  if (headerPath.startsWith(A_LIB + "/")) {
+    const parts = headerPath.slice(A_LIB.length + 1).split("/");
+    if (parts.length >= 3 && parts[1] === "src") return wrapInclude(parts.slice(2).join("/"));
+    return wrapInclude(parts.slice(1).join("/"));
   }
-
-  console.log(`📋 同步到: ${join(ARDUINO_LIB_DIR, name)}`);
-  rsyncToLib(srcDir, name);
-
-  // 清理 clone 暫存目錄
-  rmSync(cloneDir, { recursive: true, force: true });
-
-  console.log(`✅ 庫已同步: ${name}`);
+  const srcIdx = headerPath.lastIndexOf("/src/");
+  if (srcIdx !== -1) { extraDirs.push(headerPath.slice(0, srcIdx + 4)); return wrapInclude(headerPath.slice(srcIdx + 5)); }
+  extraDirs.push(dirname(headerPath));
+  return wrapInclude(basename(headerPath));
 }
 
-/**
- * 編譯 sketch
- *
- * 每次 compile 都會用 --clean 強制 full recompile，
- * 確保 Arduino library 嘅 .cpp 重新 link，唔會用 cache 咗嘅舊 object files。
- */
-function compile(sketchDir, fqbn, extraIncludeDirs = []) {
-  console.log(`\n🔨 編譯中... (FQBN: ${fqbn}) [--clean: 強制 full recompile]`);
+// 呼叫 arduino-cli compile；includeDirs 經 compiler.*.extra_flags 注入
+function compile(sketchDir, fqbn, includeDirs) {
+  let cmd = `arduino-cli compile --clean --fqbn "${fqbn}"`;
+  if (includeDirs.length) {
+    const flags = includeDirs.map(dir => `-I${dir}`).join(" ").replace(/"/g, '\\"');
+    cmd += ` --build-property "compiler.c.extra_flags=${flags}" --build-property "compiler.cpp.extra_flags=${flags}"`;
+  }
   try {
-    let cmd = `arduino-cli compile --clean --fqbn "${fqbn}"`;
-    // 將 src/ 目錄及所有子目錄透過 -I 加入 compiler 搜尋路徑
-    // 同時設定 compiler.c.extra_flags 和 compiler.cpp.extra_flags
-    // 這樣就可以直接用 #include <modules/Bluetooth/BLEManager.h>
-    if (extraIncludeDirs.length > 0) {
-      const includes = extraIncludeDirs.map(d => `-I${d}`).join(" ");
-      const escaped = includes.replace(/"/g, '\\"');
-      cmd += ` --build-property "compiler.c.extra_flags=${escaped}" --build-property "compiler.cpp.extra_flags=${escaped}"`;
-    }
-    cmd += ` "${sketchDir}" 2>&1`;
-    const output = run(cmd, { timeout: 120000 });
-    return { success: true, output, errors: [] };
+    const output = run(`${cmd} "${sketchDir}" 2>&1`);
+    return { ok: true, out: output, errors: [] };
   } catch (e) {
-    const stderr = e.stderr || e.stdout || e.message;
-    const errors = stderr
-      .split("\n")
-      .filter((l) => /error:/i.test(l))
-      .map((l) => l.trim());
-    return { success: false, output: stderr, errors };
+    const errorOutput = e.stderr || e.stdout || e.message;
+    return { ok: false, out: errorOutput, errors: errorOutput.split("\n").filter(line => /error:/i.test(line)).map(line => line.trim()) };
   }
 }
 
-// ============ Main ============
-
-async function main() {
-  const opts = parseArgs();
-  let sketchDir, tmpDir, extraIncludeDirs = [];
-
-  console.log("🚀 Arduino 編譯檢查開始\n");
-  console.log(`📁 庫目錄: ${ARDUINO_LIB_DIR}`);
-
-  ensureLibDir();
-
-  // 1. 同步本地 library 到 Arduino libraries
-  if (opts.libName) {
-    syncLocalLib(opts.libName, opts.headerPath ? dirname(opts.headerPath) : null);
+// ---- main ----
+const args = process.argv.slice(2);
+const options = { code: null, sketch: null, header: null, fqbn: null, libs: [], sync: null };
+for (let i = 0; i < args.length; i++) {
+  switch (args[i]) {
+    case "--code": options.code = args[++i]; break;
+    case "--sketch": options.sketch = args[++i]; break;
+    case "--header": options.header = args[++i]; break;
+    case "--fqbn": options.fqbn = args[++i]; break;
+    case "--lib": { const [url, name] = args[++i].split(",").map(s => s.trim()); if (url && name) options.libs.push({ url, name }); break; }
+    case "--lib-sync": options.sync = args[++i]; break;
+    case "-h": case "--help":
+      console.log(`Usage:\n  node compile.mjs --code <code> --fqbn <FQBN>\n  node compile.mjs --sketch <path> --fqbn <FQBN>\n  node compile.mjs --header <path> --fqbn <FQBN>\n  node compile.mjs --lib-sync <lib-path>\nOptions:\n  --code <string>      .ino code\n  --sketch <path>      .ino file\n  --header <path>      .h file (auto wraps)\n  --fqbn <string>      board FQBN\n  --lib "url,name"     GitHub lib\n  --lib-sync <path>    rsync local lib dir into A_LIB (validates lib root)`); process.exit(0);
   }
-
-  // 2. 處理 GitHub 庫同步
-  if (opts.libs.length > 0) {
-    for (const lib of opts.libs) {
-      syncGithubLib(lib.url, lib.name);
-    }
-  }
-
-  // 3. 如果淨係 sync → 完
-  if (!opts.hasCode) {
-    const output = { success: true, output: "Sync only, no compile requested" };
-    console.log(`\n---JSON-RESULT---\n${JSON.stringify(output)}\n---JSON-RESULT---`);
-    process.exit(0);
-  }
-
-  // 4. 如果係 --header 且 header 唔喺 Arduino/libraries 入面 → auto sync 成個 library folder
-  if (opts.headerPath && !opts.headerPath.startsWith(ARDUINO_LIB_DIR + "/")) {
-    const lib = findLibRoot(opts.headerPath);
-    if (!lib) {
-      console.error(`錯誤: 無法偵測 library root，路徑: ${opts.headerPath}`);
-      process.exit(1);
-    }
-    rsyncToLib(lib.root, lib.name);
-  }
-
-  // 自動掃描 ~/Documents/Arduino/libraries/*/src/ 下所有子目錄加入 -I
-  extraIncludeDirs = scanLibraries();
-
-  // 5. 準備 sketch
-  if (opts.code) {
-    const result = createTempSketch(opts.code);
-    sketchDir = result.sketchDir;
-    tmpDir = result.tmpDir;
-    console.log(`📝 建立暫存 sketch: ${result.inoPath}`);
-  } else if (opts.sketchPath) {
-    if (!existsSync(opts.sketchPath)) {
-      console.error(`錯誤: 檔案不存在: ${opts.sketchPath}`);
-      process.exit(1);
-    }
-    sketchDir = dirname(opts.sketchPath);
-    tmpDir = null;
-    console.log(`📂 使用已有 sketch: ${opts.sketchPath}`);
-  } else if (opts.headerPath) {
-    if (!existsSync(opts.headerPath)) {
-      console.error(`錯誤: 檔案不存在: ${opts.headerPath}`);
-      process.exit(1);
-    }
-    // 讀取 .h 檔案
-    const { include, code: inoCode } = resolveHeaderInclude(opts.headerPath, extraIncludeDirs);
-
-    console.log(`📄 編譯 header: ${opts.headerPath}`);
-    console.log(`📋 使用 include 形式: #include ${include}`);
-
-    // 產生 wrapper .ino（使用 library 風格的 include）
-    const result = createTempSketch(inoCode);
-    sketchDir = result.sketchDir;
-    tmpDir = result.tmpDir;
-    console.log(`📝 建立 wrapper sketch: ${result.inoPath}`);
-    console.log(`📋 --- wrapper .ino 內容 ---\n${inoCode}\n--- wrapper .ino 結束 ---`);
-  }
-
-  // 3. 編譯
-  const result = compile(sketchDir, opts.fqbn, extraIncludeDirs);
-
-  // 4. 輸出結果
-  if (result.success) {
-    console.log(`\n✅ 編譯成功!\n`);
-    console.log(result.output);
-  } else {
-    console.log(`\n❌ 編譯失敗!\n`);
-    console.log(result.output);
-    if (result.errors.length > 0) {
-      console.log(`\n📋 錯誤摘要 (${result.errors.length} 個):`);
-      result.errors.forEach((e, i) => console.log(`  ${i + 1}. ${e}`));
-    }
-  }
-
-  // 5. 清理暫存檔案
-  if (tmpDir) {
-    if (result.success) {
-      rmSync(tmpDir, { recursive: true, force: true });
-      console.log(`\n🧹 暫存檔案已清理`);
-    } else {
-      console.log(`\n📁 暫存 sketch 保留在: ${tmpDir}（編譯失敗，供除錯）`);
-    }
-  }
-
-  // 6. 輸出 JSON 結果給 agent 解析
-  const inoContent = opts.code || (opts.headerPath ? `#include "${opts.headerPath}"\n\nvoid setup() {}\nvoid loop() {}` : null);
-  const output = {
-    success: result.success,
-    output: result.output,
-    errors: result.errors,
-    sketchDir: result.success ? null : tmpDir || sketchDir,
-    inoContent: inoContent,
-  };
-  console.log(`\n---JSON-RESULT---\n${JSON.stringify(output)}\n---JSON-RESULT---`);
-
-  process.exit(result.success ? 0 : 1);
 }
 
-main().catch((e) => {
-  console.error("致命錯誤:", e.message);
-  process.exit(1);
-});
+const hasCode = options.code || options.sketch || options.header;
+if (hasCode && !options.fqbn) { console.error("Need --fqbn"); process.exit(1); }
+if (!hasCode && !options.sync) { console.error("Need --code/--sketch/--header or --lib-sync"); process.exit(1); }
+
+mkdirSync(A_LIB, { recursive: true });
+
+// --lib-sync：驗證路徑係 library 之後 rsync 入 A_LIB（本身喺 A_LIB 內就 skip）
+if (options.sync) {
+  const isLib = path => existsSync(join(path, "src")) || existsSync(join(path, "library.properties"));
+  if (!existsSync(options.sync)) { console.error("Not found:", options.sync); process.exit(1); }
+  if (!isLib(options.sync)) { console.error(`Not a library: ${options.sync} (need library.properties or src/)`); process.exit(1); }
+  if (options.sync.startsWith(A_LIB + "/")) console.log(`Already in ${A_LIB}, skipping sync`);
+  else rsync(options.sync, basename(options.sync));
+}
+// --lib：GitHub clone → 搵 lib root → rsync 入 A_LIB → 清理 temp
+for (const lib of options.libs) {
+  const cloneDir = join(tmpdir(), `lib-${Date.now()}-${lib.name}`);
+  run(`git clone --depth 1 "${lib.url}" "${cloneDir}"`, 60000);
+  const libRoot = findLibRoot(cloneDir);
+  rsync(libRoot ? libRoot.root : cloneDir, lib.name);
+  rmSync(cloneDir, { recursive: true, force: true });
+}
+if (!hasCode) { console.log(JSON.stringify({ success: true, output: "Sync only" })); process.exit(0); }
+
+// --header 喺 A_LIB 外：先 rsync 個 library 入 A_LIB 先 compile
+if (options.header && !options.header.startsWith(A_LIB + "/")) {
+  const libRoot = findLibRoot(options.header);
+  if (!libRoot) { console.error("Cannot detect lib root:", options.header); process.exit(1); }
+  rsync(libRoot.root, libRoot.name);
+}
+
+const includeDirs = [];
+let sketchDir, tmp;
+
+// 建立 sketch 目錄：--code / --header 寫入 temp，--sketch 直接用原目錄
+if (options.code) {
+  tmp = join(tmpdir(), `ac-${Date.now()}`); sketchDir = join(tmp, "s");
+  mkdirSync(sketchDir, { recursive: true }); writeFileSync(join(sketchDir, "s.ino"), options.code);
+} else if (options.sketch) {
+  if (!existsSync(options.sketch)) { console.error("File not found:", options.sketch); process.exit(1); }
+  sketchDir = dirname(options.sketch);
+} else {
+  if (!existsSync(options.header)) { console.error("File not found:", options.header); process.exit(1); }
+  const resolved = resolveInclude(options.header, includeDirs);
+  tmp = join(tmpdir(), `ac-${Date.now()}`); sketchDir = join(tmp, "s");
+  mkdirSync(sketchDir, { recursive: true }); writeFileSync(join(sketchDir, "s.ino"), resolved.code);
+}
+
+const result = compile(sketchDir, options.fqbn, includeDirs);
+const json = {
+  success: result.ok, output: result.out, errors: result.errors,
+  sketchDir: result.ok ? null : tmp || sketchDir,
+  inoContent: options.code || (options.header ? `#include "${options.header}"\n\nvoid setup() {}\nvoid loop() {}` : null),
+};
+console.log(JSON.stringify(json));
+if (tmp && result.ok) rmSync(tmp, { recursive: true, force: true });
+process.exit(result.ok ? 0 : 1);
